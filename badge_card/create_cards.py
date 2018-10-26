@@ -579,7 +579,7 @@ def main(argv):
         print "Processing file: {}".format(config_path)
         bundle = Bundle.parse_from_json(config_path)
         bundle.generate_images()
-#        bundle.generate_pdfs()
+        bundle.generate_pdfs()
 
 if __name__ == "__main__":
     main(sys.argv)
