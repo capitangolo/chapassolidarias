@@ -14,7 +14,7 @@ import sys
 image_size = 51 * mm
 image_locations = {'x':23, 'y':10, 'columns':3, 'rows':5}
 image_margin = 5 * mm
-scale = 1 #0.9167
+scale = 0.9167
 
 
 def generate_pdf(image, image_size, image_locations, image_margin, output_file):
