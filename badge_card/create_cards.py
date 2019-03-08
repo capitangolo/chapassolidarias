@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+import argparse
+from copy import copy
+import functools
 import math
 import json
+import operator
 import os
 
 from PIL import Image, ImageDraw, ImageFont
@@ -69,39 +72,36 @@ class Bundle:
         return self.counters[counter_name]
 
 
-    def generate_pdfs(self):
+    def generate_pdf(self, output_folder, page_format, orientation):
+        non_empty_batches = {}
         self.counters = {}
         for batch in self.batches:
-            if batch.count <= 0:
-                continue
-            for template_name in batch.templates:
-                template = self.templates[template_name]
-                self.generate_pdf_for(batch, template)
+            if batch.count > 0:
+                batch_set_id = batch.set
+                if batch_set_id not in non_empty_batches.keys():
+                    non_empty_batches[batch_set_id] = []
+                batch_set = non_empty_batches[batch_set_id]
+                batch_set.append(batch)
+
+        for batch_set in non_empty_batches.values():
+            card_size = self.templates[batch_set[0].templates[0]].size
+            self.generate_pdf_for(batch_set, output_folder, card_size, page_format, orientation)
 
 
-    def generate_pdf_for(self, batch, template):
-        # Delta y to adjust printer fails
-        delta_y = 0
-        delta_x = 0
-        for offset_key in self.page.templates_offsets.keys():
-            if offset_key in template.name:
-                offset = self.page.templates_offsets[offset_key]
-                delta_x = offset[0] * mm
-                delta_y = offset[1] * mm
+    def generate_pdf_for(self, batches, output_folder, card_size, page_format, orientation):
+        output_file = "{}.pdf".format(batches[0].set)
+        output_path_pdf = os.path.join(output_folder, "pdf")
+        output_path_file = os.path.join(output_path_pdf, output_file)
 
+        if not os.path.exists(output_path_pdf):
+            os.makedirs(output_path_pdf)
 
-        output_file = "{}_{}.pdf".format(batch.id, template.name)
-        output_path_file = os.path.join(self.page.output_path_pdf, output_file)
-
-        if not os.path.exists(self.page.output_path_pdf):
-            os.makedirs(self.page.output_path_pdf)
-
-        print "     Working on {}".format(output_file)
+        print("     Working on {}".format(output_file))
 
         page_size = A4
-        if self.page.size == 'A3':
+        if page_format == 'A3':
             page_size = A3
-        if self.page.orientation == 'landscape':
+        if orientation == 'landscape':
             page_size = (page_size[1], page_size[0])
         c = canvas.Canvas(output_path_file, pagesize=page_size)
         width, height = page_size
@@ -109,72 +109,160 @@ class Bundle:
         available_width = width - (self.page.margin[0] * mm)
         available_height = height - (self.page.margin[1] * mm)
 
-        column_width = template.size[0] * mm
-        row_height = template.size[1] * mm
+        column_width = card_size[0] * mm
+        row_height = card_size[1] * mm
 
         columns = int (available_width / column_width)
         rows = int (available_height / row_height)
+        cards_per_page = columns * rows
+
+        card_count = 0
+        batch_counts = set()
+        for batch in batches:
+            card_count += batch.count * len(batch.templates)
+            batch_counts.add(len(batch.templates))
+        page_count = math.ceil(card_count / cards_per_page)
+
+        # page_count must be multiple of the number templates in batches.
+        multiplier = functools.reduce(operator.mul, list(batch_counts), 1)
+        page_count = math.ceil(page_count / multiplier) * multiplier
+
+        # This leave empty spaces on the last cards.
+        # Fill the gaps with the latest batch.
+        last_batch = copy(batches[-1])
+        empty_spaces = (page_count * cards_per_page) - card_count
+        extra_cards_count = empty_spaces / len(last_batch.templates)
+        last_batch.count = extra_cards_count
+        batches.append(last_batch)
+
+        # Generate base images for cards
+        image_readers = {}
+        for batch in batches:
+            for template_name in batch.templates:
+                template = self.templates[template_name]
+                image = self.generate_image_for(batch, template)
+                if not batch.id in image_readers.keys():
+                    image_readers[batch.id] = {}
+                image_readers[batch.id][template_name] = ImageReader(image)
+
+        # Order cards on pages
+        pages = [None] * page_count
+        page = 0
+        column = 0
+        row = 0
+        initial_card = 0
+        cards_processed = 0
+        for batch in batches:
+            template_count = len(batch.templates)
+            initial_card = cards_processed
+
+            while (cards_processed - initial_card) < (batch.count * template_count):
+                for template_name in batch.templates:
+                    # Initialize page
+                    if row == 0 and column == 0:
+                        pages[page] = [None] * rows
+                        for i in range(0, len(pages[page])):
+                            pages[page][i] = [None] * columns
+                    # Odd pages and Even should be mirrored
+                    row_column = column
+                    if page % 2 == 1:
+                        row_column = columns - column - 1
+                    # Set the propper template
+                    card = {
+                        "batch": batch,
+                        "template": template_name
+                    }
+                    pages[page][row][row_column] = card
+                    last_card = card
+                    # Imcrement counters
+                    page += 1
+                    if page >= page_count:
+                        page = 0
+                        column += 1
+                    if column >= columns:
+                        column = 0
+                        row += 1
+                    cards_processed +=1
+
+        # Graphic positions
+        mul = 10
+        c0 = columns * mul // 2 * -1
+        cn = (c0 * -1)
+
+        r0 = rows * mul // 2 * -1
+        rn = (r0 * -1)
 
         margin_x = math.floor(float(available_width - column_width * columns) / columns)
         margin_y = math.floor(float(available_height - row_height * rows) / columns)
 
-        mul = 10
-        c0 = columns * mul / 2 * -1
-        cn = (c0 * -1)
+        # Paint cards
+        page = 0
+        while page < page_count:
+            print("Starting Page {} of {}".format(page + 1, page_count))
+            row = 0
+            for row_x in range(rn-mul, r0-mul, -mul):
+                column = 0
+                for column_y in range(c0, cn, mul):
+                    card = pages[page][row][column]
+                    if card:
+                        batch = card['batch']
+                        template_name = card['template']
+                        template = self.templates[template_name]
 
-        r0 = rows * mul / 2 * -1
-        rn = (r0 * -1)
+                        # Delta y to adjust printer fails
+                        delta_y = 0
+                        delta_x = 0
+                        for offset_key in self.page.templates_offsets.keys():
+                            if offset_key in template.name:
+                                offset = self.page.templates_offsets[offset_key]
+                                delta_x = offset[0] * mm
+                                delta_y = offset[1] * mm
 
-        image = self.generate_image_for(batch, template)
-        image_reader = ImageReader(image)
+                        x = (width / 2) + (float(column_y) / mul * (column_width + margin_x)) + margin_x / 2
+                        y = (height / 2) + (float(row_x) / mul * (row_height + margin_y)) + margin_y / 2
+                        x += delta_x
+                        y += delta_y
+                        x = int(x)
+                        y = int(y)
 
+                        for bleeding_layer in template.bleeding:
+                            bleeding_layer.render_over(x, y, c, template)
 
-        printed = 0
-        while printed <= batch.count:
-            for row in range(rn-mul, r0-mul, -mul):
-                for column in range(c0, cn, mul):
-                    x = (width / 2) + (float(column) / mul * (column_width + margin_x)) + margin_x / 2
-                    y = (height / 2) + (float(row) / mul * (row_height + margin_y)) + margin_y / 2
-                    x += delta_x
-                    y += delta_y
-                    x = int(x)
-                    y = int(y)
+                        # Image
+                        image_reader = image_readers[batch.id][template.name]
+                        c.drawImage(image_reader, x, y, width = column_width, height = row_height, mask='auto')
 
-                    for bleeding_layer in template.bleeding:
-                        bleeding_layer.render_over(x, y, c, template)
-
-                    # Image
-                    c.drawImage(image_reader, x, y, width = column_width, height = row_height, mask='auto')
-
-                    # Update vars
-                    if batch.raffle:
-                        image = self.generate_image_for(batch, template)
-                        image_reader = ImageReader(image)
-
+                        # Update vars
+                        if batch.raffle:
+                            image = self.generate_image_for(batch, template)
+                            image_readers[batch.id][template.name] = ImageReader(image)
+                    column += 1
+                row += 1
             c.showPage()
-            printed += columns * rows
+            page += 1
 
         c.save()
 
-    def generate_images(self):
+    def generate_images(self, output_folder):
         self.counters = {}
         for batch in self.batches:
             if batch.count <= 0:
                 continue
             for template_name in batch.templates:
                 template = self.templates[template_name]
-                self.generate_image_for(batch, template, True)
+                self.generate_image_for(batch, template, True, output_folder)
 
 
-    def generate_image_for(self, batch, template, save = False):
+    def generate_image_for(self, batch, template, save = False, output_folder = ''):
         image = template.image_for(batch)
 
         if save:
-            if not os.path.exists(self.page.output_path_img):
-                os.makedirs(self.page.output_path_img)
+            output_path_img = os.path.join(output_folder, "img")
+            if not os.path.exists(output_path_img):
+                os.makedirs(output_path_img)
 
-            image_name = "{}_{}.png".format(batch.id, template.name)
-            image_path = os.path.join(self.page.output_path_img, image_name)
+            image_name = "{}_{}_{}.png".format(batch.id, batch.set, template.name)
+            image_path = os.path.join(output_path_img, image_name)
             image.save(image_path)
 
         return image
@@ -183,29 +271,16 @@ class Page:
 
     @staticmethod
     def parse_from_json(basedir, json_config):
-        orientation = "portrait"
-        if "orientation" in json_config['page'].keys():
-            orientation = json_config['page']['orientation']
-
-        output_folder_pdf = "output/pdf"
-        if "output_folder_pdf" in json_config['page'].keys():
-            output_folder_pdf = json_config['page']['output_folder_pdf']
-        output_path_pdf = os.path.join(basedir, output_folder_pdf)
-        output_folder_img = "output/img"
-        if "output_folder_img" in json_config['page'].keys():
-            output_folder_img = json_config['page']['output_folder_img']
-        output_path_img = os.path.join(basedir, output_folder_img)
-
-        return Page(json_config['page']['size'], orientation, json_config['page']['margin'], json_config['page']['units'], output_path_pdf, output_path_img, json_config['page']['templates'], json_config['page']['templates_offsets'])
+        return Page(
+            json_config['page']['margin'],
+            json_config['page']['units'],
+            json_config['page']['templates'],
+            json_config['page']['templates_offsets'])
 
 
-    def __init__(self, size, orientation, margin, units, output_path_pdf, output_path_img, templates, templates_offsets):
-        self.size = size
-        self.orientation = orientation
+    def __init__(self, margin, units, templates, templates_offsets):
         self.margin = margin
         self.units = units
-        self.output_path_pdf = output_path_pdf
-        self.output_path_img = output_path_img
         self.templates = templates
         self.templates_offsets = templates_offsets
 
@@ -216,18 +291,20 @@ class Batch:
     def parse_from_json(json_config):
         batches = []
         for batch_config in json_config['batches']:
+            batch_set = batch_config['set']
             batch_id = batch_config['id']
             count = batch_config['count']
             raffle = batch_config['raffle'] if 'raffle' in batch_config.keys() else False
             mosaic_columns = batch_config['mosaic_columns'] if 'mosaic_columns' in batch_config.keys() else 1
             local_vars = batch_config['vars']
             templates = batch_config['templates']
-            batches.append(Batch(batch_id, count, raffle, mosaic_columns, local_vars, templates))
+            batches.append(Batch(batch_set, batch_id, count, raffle, mosaic_columns, local_vars, templates))
         return batches
 
 
-    def __init__(self, batch_id, count, raffle, mosaic_columns, local_vars, templates):
+    def __init__(self,batch_set, batch_id, count, raffle, mosaic_columns, local_vars, templates):
         self.bundle = None
+        self.set = batch_set
         self.id = batch_id
         self.count = count
         self.raffle = raffle
@@ -243,6 +320,12 @@ class Batch:
         comp_vars.update(self.bundle.global_vars.copy())
         comp_vars.update(self.local_vars.copy())
         return comp_vars
+
+    def __copy__(self):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        result.__dict__.update(self.__dict__)
+        return result
 
 
 class Template:
@@ -310,10 +393,21 @@ class TextLayer(Layer):
         if layer_type != 'text':
             raise NotImplementedError
 
-        return TextLayer(json_layer['text'], json_layer['font_name'], json_layer['font_size'], json_layer['font_color'], json_layer['text_x'], json_layer['text_y'], json_layer['text_align'])
+        rotation = json_layer['rotation'] if 'rotation' in json_layer.keys() else 0
 
 
-    def __init__(self, text, font_name, font_size, font_color, text_x, text_y, text_align):
+        return TextLayer(
+            json_layer['text'],
+            json_layer['font_name'],
+            json_layer['font_size'],
+            json_layer['font_color'],
+            json_layer['text_x'],
+            json_layer['text_y'],
+            json_layer['text_align'],
+            rotation)
+
+
+    def __init__(self, text, font_name, font_size, font_color, text_x, text_y, text_align, rotation):
         self.bundle = None
         self.text = text
         self.font_name = font_name
@@ -322,6 +416,7 @@ class TextLayer(Layer):
         self.text_x = text_x
         self.text_y = text_y
         self.text_align = text_align
+        self.rotation = rotation
 
 
     def render_over(self, image, batch, res):
@@ -330,8 +425,39 @@ class TextLayer(Layer):
             texts_vals.append(batch.comp_vars[text])
         text = ''.join(texts_vals)
 
-        return TextLayer.render_text_over(image, batch, res, text, self.font_name, self.font_size, self.font_color, self.text_x, self.text_y, self.text_align)
+        if self.rotation:
+            return TextLayer.render_rotated_text_over(image, batch, res, text, self.font_name, self.font_size, self.font_color, self.text_x, self.text_y, self.text_align, self.rotation)
+        else:
+            return TextLayer.render_text_over(image, batch, res, text, self.font_name, self.font_size, self.font_color, self.text_x, self.text_y, self.text_align)
 
+    @staticmethod
+    def render_rotated_text_over(image, batch, res, text, font_name, font_size, font_color, text_x, text_y, text_align, rotation):
+        # Prepare
+        font = ImageFont.truetype(font_name, int(font_size))
+        spacing = 1
+        draw = ImageDraw.Draw(image)
+        text_size = draw.textsize(text, font=font, spacing=spacing)
+
+        # Image for text to be rotated
+        img_txt = Image.new('RGBA', text_size, (255, 255, 255, 0))
+        draw_txt = ImageDraw.Draw(img_txt)
+
+        draw_txt.text([0,0], text, font=font, fill=hex_to_rgb(font_color), spacing=spacing, align='right')
+        rotated_text_img = img_txt.rotate(rotation, expand=1)
+
+        rotated_text_width, rotated_text_height = rotated_text_img.size
+        orig = [int(text_x * res), int(text_y * res)]
+        if text_align == 'right': # Right Top
+            orig[0] -= rotated_text_width
+        elif text_align == 'left': # Left Bottom
+            orig[1] -= rotated_text_height
+        elif text_align == 'center': # Center X / Y
+            orig[0] -= int(rotated_text_width / 2)
+            orig[1] -= int(rotated_text_height / 2)
+
+        image.paste(rotated_text_img, orig, rotated_text_img)
+
+        return image
 
     @staticmethod
     def render_text_over(image, batch, res, text, font_name, font_size, font_color, text_x, text_y, text_align):
@@ -364,10 +490,22 @@ class TextCounterLayer(Layer):
         if layer_type != 'text_counter':
             raise NotImplementedError
 
-        return TextCounterLayer(json_layer['counter'], json_layer['alt_text'], json_layer['font_name'], json_layer['font_size'], json_layer['alt_font_size'], json_layer['font_color'], json_layer['text_x'], json_layer['text_y'], json_layer['text_align'])
+        rotation = json_layer['rotation'] if 'rotation' in json_layer.keys() else 0
+
+        return TextCounterLayer(
+            json_layer['counter'],
+            json_layer['alt_text'],
+            json_layer['font_name'],
+            json_layer['font_size'],
+            json_layer['alt_font_size'],
+            json_layer['font_color'],
+            json_layer['text_x'],
+            json_layer['text_y'],
+            json_layer['text_align'],
+            rotation)
 
 
-    def __init__(self, counter, alt_text, font_name, font_size, alt_font_size, font_color, text_x, text_y, text_align):
+    def __init__(self, counter, alt_text, font_name, font_size, alt_font_size, font_color, text_x, text_y, text_align, rotation):
         self.bundle = None
         self.counter = counter
         self.alt_text = alt_text
@@ -378,16 +516,20 @@ class TextCounterLayer(Layer):
         self.text_x = text_x
         self.text_y = text_y
         self.text_align = text_align
+        self.rotation = rotation
 
 
     def render_over(self, image, batch, res):
         text = batch.comp_vars[self.alt_text]
         font_size = self.alt_font_size
         if batch.raffle:
-            text = str(self.bundle.increment_counter(self.counter))
+            text = str(self.bundle.increment_counter('{}_{}'.format(batch.id, self.counter)))
             font_size = self.font_size
 
-        return TextLayer.render_text_over(image, batch, res, text, self.font_name, font_size, self.font_color, self.text_x, self.text_y, self.text_align)
+        if self.rotation:
+            return TextLayer.render_rotated_text_over(image, batch, res, text, self.font_name, font_size, self.font_color, self.text_x, self.text_y, self.text_align, self.rotation)
+        else:
+            return TextLayer.render_text_over(image, batch, res, text, self.font_name, font_size, self.font_color, self.text_x, self.text_y, self.text_align)
 
 
 class ImageLayer(Layer):
@@ -575,11 +717,32 @@ class CutLinesLayer(Layer):
 
 
 def main(argv):
-    for config_path in argv[1:]:
-        print "Processing file: {}".format(config_path)
+    parser = argparse.ArgumentParser(description='Generate cards from config file.')
+    parser.add_argument('-c', '--configs', nargs='+', required=True,
+                        help='Config files to process')
+    parser.add_argument('-p', '--generate-pdf', action='store_true',
+                        help='Generate a ready to print pdf')
+    parser.add_argument('-i', '--generate-png', action='store_true',
+                        help='Generate one png image for every type of card')
+    parser.add_argument('-s', '--pdf-size', choices=['A4', 'A3'], default='A3',
+                        help='If output is a pdf file, the size of the pdf pages')
+    parser.add_argument('-r', '--pdf-orientation', choices=['portrait', 'landscape'], default='landscape',
+                        help='If output is a pdf file, the orientation of the pdf pages')
+    parser.add_argument('-o', '--output-folder', default=os.getcwd(),
+                        help='Output folder where to store the cards. Defaults to the current directory.')
+
+    args = parser.parse_args()
+
+    for config_path in args.configs:
+        print("Processing file: {}".format(config_path))
         bundle = Bundle.parse_from_json(config_path)
-        bundle.generate_images()
-        bundle.generate_pdfs()
+        if args.generate_png:
+            bundle.generate_images(output_folder=args.output_folder)
+        if args.generate_pdf:
+            bundle.generate_pdf(
+                output_folder=args.output_folder,
+                page_format=args.pdf_size,
+                orientation=args.pdf_orientation)
 
 if __name__ == "__main__":
     main(sys.argv)
