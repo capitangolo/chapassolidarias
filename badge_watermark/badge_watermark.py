@@ -48,7 +48,7 @@ def main(argv):
     watermark_filepath = argv[1]
     watermark = Image.open(watermark_filepath)
     watermark_alpha = Image.new("RGBA", watermark.size)
-    watermark = Image.blend(watermark, watermark_alpha, 0.2)
+    watermark = Image.blend(watermark, watermark_alpha, 0)
 
     for input_image_file in argv[2:]:
         input_image = Image.open(input_image_file)
