@@ -129,11 +129,10 @@ class Bundle:
 
         # This leave empty spaces on the last cards.
         # Fill the gaps with the latest batch.
-        last_batch = copy(batches[-1])
+        last_batch = batches[-1]
         empty_spaces = (page_count * cards_per_page) - card_count
         extra_cards_count = empty_spaces / len(last_batch.templates)
-        last_batch.count = extra_cards_count
-        batches.append(last_batch)
+        last_batch.count += extra_cards_count
 
         # Generate base images for cards
         image_readers = {}
