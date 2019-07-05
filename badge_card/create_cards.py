@@ -9,6 +9,8 @@ import operator
 import os
 
 from PIL import Image, ImageDraw, ImageFont
+# Workaraund for a bug in reportlab
+Image.VERSION = '6.0.0'
 
 from reportlab.lib.pagesizes import A4, A3
 from reportlab.lib.units import mm
@@ -23,8 +25,13 @@ def hex_to_rgb(hex_str):
 
 class Bundle:
 
+    RESERVED_COUNTERS = [
+        "batch.index",
+        "bundle.index",
+    ]
+
     @staticmethod
-    def parse_from_json(config_path):
+    def parse_from_json(config_path, debug = False):
 
         with open(config_path) as config_file:
             basedir = os.path.dirname(config_file.name)
@@ -41,16 +48,17 @@ class Bundle:
             json_templates = json.load(templates_file)
         templates = Template.parse_from_json(json_templates)
 
-        return Bundle(basedir, page, global_vars, batches, templates)
+        return Bundle(basedir, page, global_vars, batches, templates, debug)
 
 
-    def __init__(self, basedir, page, global_vars, batches, templates):
+    def __init__(self, basedir, page, global_vars, batches, templates, debug = False):
         self.basedir = basedir
         self.page = page
         self.global_vars = global_vars
         self.batches = batches
         self.templates = templates
         self.counters = {}
+        self.debug = debug
 
         for batch in self.batches:
             batch.bundle = self
@@ -67,7 +75,8 @@ class Bundle:
         if counter_name not in self.counters.keys():
             self.counters[counter_name] = 0
 
-        self.counters[counter_name] += 1
+        if counter_name not in Bundle.RESERVED_COUNTERS:
+            self.counters[counter_name] += 1
 
         return self.counters[counter_name]
 
@@ -151,12 +160,15 @@ class Bundle:
         row = 0
         initial_card = 0
         cards_processed = 0
+        bundle_index = 1
         for batch in batches:
+            batch_index = 1
             template_count = len(batch.templates)
             initial_card = cards_processed
 
             while (cards_processed - initial_card) < (batch.count * template_count):
                 for template_name in batch.templates:
+                    # Initialize counter
                     # Initialize page
                     if row == 0 and column == 0:
                         pages[page] = [None] * rows
@@ -169,7 +181,11 @@ class Bundle:
                     # Set the propper template
                     card = {
                         "batch": batch,
-                        "template": template_name
+                        "template": template_name,
+                        "counters": {
+                            "batch.index": batch_index,
+                            "bundle.index": bundle_index,
+                        }
                     }
                     pages[page][row][row_column] = card
                     last_card = card
@@ -182,6 +198,10 @@ class Bundle:
                         column = 0
                         row += 1
                     cards_processed +=1
+
+                # Increase the card index inside a bundle, AFTER all the templates for that card are rendered.
+                batch_index +=1
+                bundle_index +=1
 
         # Graphic positions
         mul = 10
@@ -224,17 +244,27 @@ class Bundle:
                         x = int(x)
                         y = int(y)
 
+                        # Reset global counters
+                        for counter_name, counter_value in card['counters'].items():
+                            self.counters[counter_name] = counter_value
+
+                        # Bleeding
                         for bleeding_layer in template.bleeding:
                             bleeding_layer.render_over(x, y, c, template)
+
+                        # Re-Generate image with counters
+                        if batch.raffle:
+                            image = self.generate_image_for(batch, template)
+                            image_readers[batch.id][template.name] = ImageReader(image)
 
                         # Image
                         image_reader = image_readers[batch.id][template.name]
                         c.drawImage(image_reader, x, y, width = column_width, height = row_height, mask='auto')
 
-                        # Update vars
-                        if batch.raffle:
-                            image = self.generate_image_for(batch, template)
-                            image_readers[batch.id][template.name] = ImageReader(image)
+                        # Debug
+                        if self.debug:
+                            c.drawString(x, y, "{}_{}".format(self.counters["bundle.index"], self.counters["batch.index"]))
+
                     column += 1
                 row += 1
             c.showPage()
@@ -522,7 +552,11 @@ class TextCounterLayer(Layer):
         text = batch.comp_vars[self.alt_text]
         font_size = self.alt_font_size
         if batch.raffle:
-            text = str(self.bundle.increment_counter('{}_{}'.format(batch.id, self.counter)))
+            if self.counter in Bundle.RESERVED_COUNTERS:
+                text = str(self.bundle.increment_counter(self.counter))
+            else:
+                text = str(self.bundle.increment_counter('{}_{}'.format(batch.id, self.counter)))
+
             font_size = self.font_size
 
         if self.rotation:
@@ -665,8 +699,8 @@ class FillColorLayer(Layer):
         self.height = height
 
     def render_over(self, x, y, canvas, template):
-        color =  hex_to_rgb(self.color)
-        canvas.setFillColorRGB(color[0], color[1], color[2])
+        color = hex_to_rgb(self.color)
+        canvas.setFillColorRGB(color[0]/255.0, color[1]/255.0, color[2]/255.0)
         canvas.rect(x + (self.x * mm), y + (self.y * mm), self.width * mm, self.height * mm, fill=1)
 
         canvas.setFillColorRGB(0,0,0)
@@ -695,28 +729,30 @@ class CutLinesLayer(Layer):
         row_height = template.size[1] * mm
 
         color =  hex_to_rgb(self.colors[3])
-        canvas.setStrokeColorRGB(color[0], color[1], color[2])
+        canvas.setStrokeColorRGB(color[0]/255.0, color[1]/255.0, color[2]/255.0)
         canvas.line(x - (self.margin0 * mm), y, x - (self.margin1 * mm), y)
         canvas.line(x, y - (self.margin0 * mm), x , y - (self.margin1 * mm))
 
         color =  hex_to_rgb(self.colors[0])
-        canvas.setStrokeColorRGB(color[0], color[1], color[2])
+        canvas.setStrokeColorRGB(color[0]/255.0, color[1]/255.0, color[2]/255.0)
         canvas.line(x - (self.margin0 * mm), y + row_height + (self.margin1 * mm), x - (self.margin1 * mm), y + row_height + (self.margin1 * mm))
         canvas.line(x, y + row_height + (self.margin0 * mm), x, y + row_height + (self.margin1 * mm))
 
         color =  hex_to_rgb(self.colors[2])
-        canvas.setStrokeColorRGB(color[0], color[1], color[2])
+        canvas.setStrokeColorRGB(color[0]/255.0, color[1]/255.0, color[2]/255.0)
         canvas.line(x + column_width + (self.margin1 * mm), y, x + column_width + (self.margin0 * mm), y)
         canvas.line(x + column_width, y - (self.margin0 * mm), x + column_width , y - (self.margin1 * mm))
 
         color =  hex_to_rgb(self.colors[1])
-        canvas.setStrokeColorRGB(color[0], color[1], color[2])
+        canvas.setStrokeColorRGB(color[0]/255.0, color[1]/255.0, color[2]/255.0)
         canvas.line(x + column_width + (self.margin1 * mm), y + row_height + (self.margin1 * mm), x + column_width + (self.margin0 * mm), y + row_height + (self.margin1 * mm))
         canvas.line(x + column_width, y + row_height + (self.margin0 * mm), x + column_width, y + row_height + (self.margin1 * mm))
 
 
 def main(argv):
     parser = argparse.ArgumentParser(description='Generate cards from config file.')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Dump debug information in the pdfs')
     parser.add_argument('-c', '--configs', nargs='+', required=True,
                         help='Config files to process')
     parser.add_argument('-p', '--generate-pdf', action='store_true',
@@ -734,14 +770,15 @@ def main(argv):
 
     for config_path in args.configs:
         print("Processing file: {}".format(config_path))
-        bundle = Bundle.parse_from_json(config_path)
+        bundle = Bundle.parse_from_json(config_path, debug = args.debug)
         if args.generate_png:
             bundle.generate_images(output_folder=args.output_folder)
         if args.generate_pdf:
             bundle.generate_pdf(
                 output_folder=args.output_folder,
                 page_format=args.pdf_size,
-                orientation=args.pdf_orientation)
+                orientation=args.pdf_orientation,
+            )
 
 if __name__ == "__main__":
     main(sys.argv)
